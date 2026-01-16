@@ -7,6 +7,17 @@ let mcpServerProcess: ChildProcess | null = null;
 
 const isDev = process.env.NODE_ENV !== 'production' || !app.isPackaged;
 
+// Get the project root directory
+function getProjectRoot(): string {
+  if (isDev) {
+    // In dev mode, we're running from electron-app/src/main
+    return path.resolve(__dirname, '../../..');
+  } else {
+    // In production, we're running from electron-app/dist/main
+    return path.resolve(__dirname, '../../..');
+  }
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -42,33 +53,49 @@ function createWindow(): void {
 }
 
 function startMcpServer(): void {
-  const mcpServerPath = path.join(__dirname, '../../mcp-server');
+  const projectRoot = getProjectRoot();
+  const mcpServerPath = path.join(projectRoot, 'mcp-server');
+  const mcpServerEntry = path.join(mcpServerPath, 'src/index.ts');
 
-  console.log('[Main] Starting MCP server...');
+  console.log(`[Main] Starting MCP server from: ${mcpServerPath}`);
 
-  mcpServerProcess = spawn('npm', ['run', 'dev'], {
+  // Use npx tsx to run the server directly
+  mcpServerProcess = spawn('npx', ['tsx', mcpServerEntry], {
     cwd: mcpServerPath,
     shell: true,
     stdio: 'pipe',
+    env: { ...process.env, FORCE_COLOR: '1' },
   });
 
   mcpServerProcess.stdout?.on('data', (data) => {
-    console.log(`[MCP Server] ${data}`);
+    const output = data.toString().trim();
+    if (output) console.log(`[MCP] ${output}`);
   });
 
   mcpServerProcess.stderr?.on('data', (data) => {
-    console.error(`[MCP Server Error] ${data}`);
+    const output = data.toString().trim();
+    if (output) console.error(`[MCP] ${output}`);
+  });
+
+  mcpServerProcess.on('error', (err) => {
+    console.error('[Main] Failed to start MCP server:', err.message);
   });
 
   mcpServerProcess.on('close', (code) => {
-    console.log(`[MCP Server] Process exited with code ${code}`);
+    console.log(`[Main] MCP server exited with code ${code}`);
+    mcpServerProcess = null;
   });
 }
 
 function stopMcpServer(): void {
   if (mcpServerProcess) {
     console.log('[Main] Stopping MCP server...');
-    mcpServerProcess.kill();
+    // Kill the process tree on Windows, just the process on Unix
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', mcpServerProcess.pid!.toString(), '/f', '/t']);
+    } else {
+      mcpServerProcess.kill('SIGTERM');
+    }
     mcpServerProcess = null;
   }
 }
