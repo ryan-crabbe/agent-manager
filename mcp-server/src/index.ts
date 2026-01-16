@@ -13,19 +13,26 @@ interface Instance {
   id: string;
   workingDirectory: string;
   projectName: string;
-  status: "idle" | "working" | "waiting_input" | "waiting_permission";
+  status: InstanceStatus;
   connectedAt: Date;
   lastActivity: Date;
   outputBuffer: string[];
 }
+
+type InstanceStatus = "idle" | "working" | "waiting_input" | "waiting_permission";
+const VALID_STATUSES: InstanceStatus[] = ["idle", "working", "waiting_input", "waiting_permission"];
+
+type RequestType = "permission" | "question" | "confirmation";
+const VALID_REQUEST_TYPES: RequestType[] = ["permission", "question", "confirmation"];
 
 interface PendingRequest {
   id: string;
   instanceId: string;
   prompt: string;
   options: string[];
-  requestType: "permission" | "question" | "confirmation";
+  requestType: RequestType;
   createdAt: Date;
+  timeoutId: NodeJS.Timeout;
   resolve: (response: string) => void;
   reject: (error: Error) => void;
 }
@@ -33,10 +40,29 @@ interface PendingRequest {
 type WSEvent =
   | { type: "instance:connected"; instance: Instance }
   | { type: "instance:disconnected"; instanceId: string }
-  | { type: "instance:status"; instanceId: string; status: Instance["status"] }
-  | { type: "instance:request"; request: Omit<PendingRequest, "resolve" | "reject"> }
+  | { type: "instance:status"; instanceId: string; status: InstanceStatus }
+  | { type: "instance:request"; request: Omit<PendingRequest, "resolve" | "reject" | "timeoutId"> }
   | { type: "instance:request_resolved"; requestId: string }
   | { type: "instance:output"; instanceId: string; content: string; contentType: string };
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+const PORT = parseInt(process.env.AGENT_MANAGER_PORT || "3456", 10);
+const HOST = process.env.AGENT_MANAGER_HOST || "127.0.0.1";
+const OUTPUT_BUFFER_SIZE = 100;
+const REQUEST_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
+const STALE_INSTANCE_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_RESPONSE_LENGTH = 10000;
+const MAX_BODY_SIZE = "1mb";
+
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  `http://localhost:${PORT}`,
+  `http://127.0.0.1:${PORT}`,
+];
 
 // =============================================================================
 // State
@@ -46,8 +72,62 @@ const instances = new Map<string, Instance>();
 const pendingRequests = new Map<string, PendingRequest>();
 const wsClients = new Set<WebSocket>();
 
-const OUTPUT_BUFFER_SIZE = 100;
-const PORT = 3456;
+// =============================================================================
+// Validation Helpers
+// =============================================================================
+
+function validateString(value: unknown, fieldName: string, maxLength = 10000): string {
+  if (typeof value !== "string") {
+    throw new Error(`${fieldName} must be a string`);
+  }
+  if (value.length === 0) {
+    throw new Error(`${fieldName} cannot be empty`);
+  }
+  if (value.length > maxLength) {
+    throw new Error(`${fieldName} exceeds maximum length of ${maxLength}`);
+  }
+  return value;
+}
+
+function validateOptionalString(value: unknown, fieldName: string, maxLength = 10000): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  return validateString(value, fieldName, maxLength);
+}
+
+function validateStatus(value: unknown): InstanceStatus {
+  if (typeof value !== "string" || !VALID_STATUSES.includes(value as InstanceStatus)) {
+    throw new Error(`Invalid status. Must be one of: ${VALID_STATUSES.join(", ")}`);
+  }
+  return value as InstanceStatus;
+}
+
+function validateRequestType(value: unknown): RequestType {
+  if (typeof value !== "string" || !VALID_REQUEST_TYPES.includes(value as RequestType)) {
+    return "question"; // Default
+  }
+  return value as RequestType;
+}
+
+function validateStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function mcpError(message: string) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: message }) }],
+  };
+}
+
+function mcpSuccess(data: Record<string, unknown> = {}) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ success: true, ...data }) }],
+  };
+}
 
 // =============================================================================
 // WebSocket Broadcasting
@@ -57,10 +137,43 @@ function broadcast(event: WSEvent): void {
   const message = JSON.stringify(event);
   for (const client of wsClients) {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error("[WS] Failed to send message, removing client");
+        wsClients.delete(client);
+      }
     }
   }
 }
+
+// =============================================================================
+// Cleanup: Stale instances and timed-out requests
+// =============================================================================
+
+function cleanupStaleInstances(): void {
+  const now = Date.now();
+  for (const [id, instance] of instances) {
+    if (now - instance.lastActivity.getTime() > STALE_INSTANCE_MS) {
+      console.log(`[Cleanup] Removing stale instance: ${id}`);
+
+      // Clean up pending requests for this instance
+      for (const [requestId, request] of pendingRequests) {
+        if (request.instanceId === id) {
+          clearTimeout(request.timeoutId);
+          request.reject(new Error("Instance timed out"));
+          pendingRequests.delete(requestId);
+        }
+      }
+
+      instances.delete(id);
+      broadcast({ type: "instance:disconnected", instanceId: id });
+    }
+  }
+}
+
+// Run cleanup every minute
+setInterval(cleanupStaleInstances, 60000);
 
 // =============================================================================
 // MCP Server Setup
@@ -91,30 +204,37 @@ function createMcpServer(): McpServer {
       },
     },
     async (args) => {
-      const id = (args.instance_id as string) || uuidv4();
-      const instance: Instance = {
-        id,
-        workingDirectory: args.working_directory as string,
-        projectName: args.project_name as string,
-        status: "idle",
-        connectedAt: new Date(),
-        lastActivity: new Date(),
-        outputBuffer: [],
-      };
+      try {
+        const workingDirectory = validateString(args.working_directory, "working_directory");
+        const projectName = validateString(args.project_name, "project_name");
+        const providedId = validateOptionalString(args.instance_id, "instance_id");
 
-      instances.set(id, instance);
-      broadcast({ type: "instance:connected", instance });
+        const id = providedId || uuidv4();
 
-      console.log(`[MCP] Instance registered: ${id} (${instance.projectName})`);
+        // Check for ID collision
+        if (instances.has(id)) {
+          return mcpError("Instance ID already registered. Use a different ID or call unregister_instance first.");
+        }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ success: true, instance_id: id }),
-          },
-        ],
-      };
+        const instance: Instance = {
+          id,
+          workingDirectory,
+          projectName,
+          status: "idle",
+          connectedAt: new Date(),
+          lastActivity: new Date(),
+          outputBuffer: [],
+        };
+
+        instances.set(id, instance);
+        broadcast({ type: "instance:connected", instance });
+
+        console.log(`[MCP] Instance registered: ${id} (${instance.projectName})`);
+
+        return mcpSuccess({ instance_id: id });
+      } catch (error) {
+        return mcpError(error instanceof Error ? error.message : "Invalid arguments");
+      }
     }
   );
 
@@ -129,29 +249,27 @@ function createMcpServer(): McpServer {
       },
     },
     async (args) => {
-      const id = args.instance_id as string;
+      try {
+        const id = validateString(args.instance_id, "instance_id");
 
-      // Clean up any pending requests for this instance
-      for (const [requestId, request] of pendingRequests) {
-        if (request.instanceId === id) {
-          request.reject(new Error("Instance disconnected"));
-          pendingRequests.delete(requestId);
+        // Clean up any pending requests for this instance
+        for (const [requestId, request] of pendingRequests) {
+          if (request.instanceId === id) {
+            clearTimeout(request.timeoutId);
+            request.reject(new Error("Instance disconnected"));
+            pendingRequests.delete(requestId);
+          }
         }
+
+        instances.delete(id);
+        broadcast({ type: "instance:disconnected", instanceId: id });
+
+        console.log(`[MCP] Instance unregistered: ${id}`);
+
+        return mcpSuccess();
+      } catch (error) {
+        return mcpError(error instanceof Error ? error.message : "Invalid arguments");
       }
-
-      instances.delete(id);
-      broadcast({ type: "instance:disconnected", instanceId: id });
-
-      console.log(`[MCP] Instance unregistered: ${id}`);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ success: true }),
-          },
-        ],
-      };
     }
   );
 
@@ -170,33 +288,23 @@ function createMcpServer(): McpServer {
       },
     },
     async (args) => {
-      const id = args.instance_id as string;
-      const status = args.status as Instance["status"];
-      const instance = instances.get(id);
+      try {
+        const id = validateString(args.instance_id, "instance_id");
+        const status = validateStatus(args.status);
+        const instance = instances.get(id);
 
-      if (!instance) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ success: false, error: "Instance not found" }),
-            },
-          ],
-        };
+        if (!instance) {
+          return mcpError("Instance not found");
+        }
+
+        instance.status = status;
+        instance.lastActivity = new Date();
+        broadcast({ type: "instance:status", instanceId: id, status });
+
+        return mcpSuccess();
+      } catch (error) {
+        return mcpError(error instanceof Error ? error.message : "Invalid arguments");
       }
-
-      instance.status = status;
-      instance.lastActivity = new Date();
-      broadcast({ type: "instance:status", instanceId: id, status });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ success: true }),
-          },
-        ],
-      };
     }
   );
 
@@ -224,50 +332,62 @@ function createMcpServer(): McpServer {
       },
     },
     async (args) => {
-      const instanceId = args.instance_id as string;
-      const instance = instances.get(instanceId);
-
-      if (!instance) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ success: false, error: "Instance not found" }),
-            },
-          ],
-        };
-      }
-
-      const requestId = uuidv4();
-
-      // Create a promise that will be resolved when the user responds
-      const responsePromise = new Promise<string>((resolve, reject) => {
-        const request: PendingRequest = {
-          id: requestId,
-          instanceId,
-          prompt: args.prompt as string,
-          options: (args.options as string[]) || [],
-          requestType: (args.request_type as PendingRequest["requestType"]) || "question",
-          createdAt: new Date(),
-          resolve,
-          reject,
-        };
-
-        pendingRequests.set(requestId, request);
-
-        // Broadcast the new request (without resolve/reject functions)
-        const { resolve: _, reject: __, ...broadcastRequest } = request;
-        broadcast({ type: "instance:request", request: broadcastRequest });
-
-        console.log(`[MCP] Request created: ${requestId} from instance ${instanceId}`);
-      });
-
-      // Update instance status
-      instance.status = "waiting_input";
-      instance.lastActivity = new Date();
-      broadcast({ type: "instance:status", instanceId, status: "waiting_input" });
-
       try {
+        const instanceId = validateString(args.instance_id, "instance_id");
+        const prompt = validateString(args.prompt, "prompt");
+        const options = validateStringArray(args.options);
+        const requestType = validateRequestType(args.request_type);
+
+        const instance = instances.get(instanceId);
+
+        if (!instance) {
+          return mcpError("Instance not found");
+        }
+
+        const requestId = uuidv4();
+
+        // Create a promise that will be resolved when the user responds
+        const responsePromise = new Promise<string>((resolve, reject) => {
+          // Set up timeout
+          const timeoutId = setTimeout(() => {
+            if (pendingRequests.has(requestId)) {
+              pendingRequests.delete(requestId);
+              reject(new Error("Request timed out waiting for user response"));
+            }
+          }, REQUEST_TIMEOUT_MS);
+
+          const request: PendingRequest = {
+            id: requestId,
+            instanceId,
+            prompt,
+            options,
+            requestType,
+            createdAt: new Date(),
+            timeoutId,
+            resolve: (response: string) => {
+              clearTimeout(timeoutId);
+              resolve(response);
+            },
+            reject: (error: Error) => {
+              clearTimeout(timeoutId);
+              reject(error);
+            },
+          };
+
+          pendingRequests.set(requestId, request);
+
+          // Broadcast the new request (without internal fields)
+          const { resolve: _, reject: __, timeoutId: ___, ...broadcastRequest } = request;
+          broadcast({ type: "instance:request", request: broadcastRequest });
+
+          console.log(`[MCP] Request created: ${requestId} from instance ${instanceId}`);
+        });
+
+        // Update instance status
+        instance.status = "waiting_input";
+        instance.lastActivity = new Date();
+        broadcast({ type: "instance:status", instanceId, status: "waiting_input" });
+
         const response = await responsePromise;
 
         // Update instance status back to working
@@ -275,26 +395,9 @@ function createMcpServer(): McpServer {
         instance.lastActivity = new Date();
         broadcast({ type: "instance:status", instanceId, status: "working" });
 
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ success: true, response }),
-            },
-          ],
-        };
+        return mcpSuccess({ response });
       } catch (error) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : "Unknown error",
-              }),
-            },
-          ],
-        };
+        return mcpError(error instanceof Error ? error.message : "Unknown error");
       }
     }
   );
@@ -318,39 +421,30 @@ function createMcpServer(): McpServer {
       },
     },
     async (args) => {
-      const instanceId = args.instance_id as string;
-      const content = args.content as string;
-      const contentType = (args.content_type as string) || "text";
-      const instance = instances.get(instanceId);
+      try {
+        const instanceId = validateString(args.instance_id, "instance_id");
+        const content = validateString(args.content, "content", 50000);
+        const contentType = validateOptionalString(args.content_type, "content_type") || "text";
 
-      if (!instance) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({ success: false, error: "Instance not found" }),
-            },
-          ],
-        };
+        const instance = instances.get(instanceId);
+
+        if (!instance) {
+          return mcpError("Instance not found");
+        }
+
+        // Add to ring buffer
+        instance.outputBuffer.push(content);
+        if (instance.outputBuffer.length > OUTPUT_BUFFER_SIZE) {
+          instance.outputBuffer.shift();
+        }
+
+        instance.lastActivity = new Date();
+        broadcast({ type: "instance:output", instanceId, content, contentType });
+
+        return mcpSuccess();
+      } catch (error) {
+        return mcpError(error instanceof Error ? error.message : "Invalid arguments");
       }
-
-      // Add to ring buffer
-      instance.outputBuffer.push(content);
-      if (instance.outputBuffer.length > OUTPUT_BUFFER_SIZE) {
-        instance.outputBuffer.shift();
-      }
-
-      instance.lastActivity = new Date();
-      broadcast({ type: "instance:output", instanceId, content, contentType });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ success: true }),
-          },
-        ],
-      };
     }
   );
 
@@ -362,13 +456,21 @@ function createMcpServer(): McpServer {
 // =============================================================================
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: MAX_BODY_SIZE }));
 
-// CORS for local development
-app.use((_req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+// CORS - restricted to allowed origins
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
   next();
 });
 
@@ -386,7 +488,7 @@ app.get("/api/instances", (_req: Request, res: Response) => {
 // Get all pending requests
 app.get("/api/requests", (_req: Request, res: Response) => {
   const requestList = Array.from(pendingRequests.values()).map(
-    ({ resolve, reject, ...rest }) => rest
+    ({ resolve, reject, timeoutId, ...rest }) => rest
   );
   res.json(requestList);
 });
@@ -395,6 +497,17 @@ app.get("/api/requests", (_req: Request, res: Response) => {
 app.post("/api/respond/:requestId", (req: Request, res: Response) => {
   const { requestId } = req.params;
   const { response } = req.body;
+
+  // Input validation
+  if (typeof response !== "string") {
+    res.status(400).json({ error: "Response must be a string" });
+    return;
+  }
+
+  if (response.length > MAX_RESPONSE_LENGTH) {
+    res.status(400).json({ error: `Response exceeds maximum length of ${MAX_RESPONSE_LENGTH}` });
+    return;
+  }
 
   const request = pendingRequests.get(requestId);
   if (!request) {
@@ -406,7 +519,7 @@ app.post("/api/respond/:requestId", (req: Request, res: Response) => {
   pendingRequests.delete(requestId);
   broadcast({ type: "instance:request_resolved", requestId });
 
-  console.log(`[API] Request resolved: ${requestId} with response: ${response}`);
+  console.log(`[API] Request resolved: ${requestId}`);
 
   res.json({ success: true });
 });
@@ -434,26 +547,42 @@ const transports = new Map<string, SSEServerTransport>();
 app.get("/mcp", async (req: Request, res: Response) => {
   console.log("[MCP] New SSE connection");
 
-  const transport = new SSEServerTransport("/mcp/message", res);
   const sessionId = uuidv4();
+  const transport = new SSEServerTransport(`/mcp/message?sessionId=${sessionId}`, res);
   transports.set(sessionId, transport);
 
   res.on("close", () => {
-    console.log("[MCP] SSE connection closed");
+    console.log(`[MCP] SSE connection closed: ${sessionId}`);
     transports.delete(sessionId);
   });
 
-  await mcpServer.connect(transport);
+  try {
+    await mcpServer.connect(transport);
+  } catch (error) {
+    console.error("[MCP] Connection error:", error);
+    transports.delete(sessionId);
+  }
 });
 
 app.post("/mcp/message", async (req: Request, res: Response) => {
-  // Find the transport that should handle this message
-  // In practice, we need session management here
-  const transport = Array.from(transports.values())[0];
-  if (transport) {
+  const sessionId = req.query.sessionId as string;
+
+  if (!sessionId) {
+    res.status(400).json({ error: "Missing sessionId" });
+    return;
+  }
+
+  const transport = transports.get(sessionId);
+  if (!transport) {
+    res.status(404).json({ error: "Session not found or expired" });
+    return;
+  }
+
+  try {
     await transport.handlePostMessage(req, res);
-  } else {
-    res.status(400).json({ error: "No active MCP connection" });
+  } catch (error) {
+    console.error("[MCP] Message handling error:", error);
+    res.status(500).json({ error: "Failed to process message" });
   }
 });
 
@@ -470,19 +599,32 @@ wss.on("connection", (ws: WebSocket) => {
   wsClients.add(ws);
 
   // Send current state to new client
-  ws.send(
-    JSON.stringify({
-      type: "init",
-      instances: Array.from(instances.values()),
-      pendingRequests: Array.from(pendingRequests.values()).map(
-        ({ resolve, reject, ...rest }) => rest
-      ),
-    })
-  );
+  try {
+    ws.send(
+      JSON.stringify({
+        type: "init",
+        instances: Array.from(instances.values()),
+        pendingRequests: Array.from(pendingRequests.values()).map(
+          ({ resolve, reject, timeoutId, ...rest }) => rest
+        ),
+      })
+    );
+  } catch (error) {
+    console.error("[WS] Failed to send init message:", error);
+  }
+
+  const cleanup = () => {
+    wsClients.delete(ws);
+  };
 
   ws.on("close", () => {
     console.log("[WS] Client disconnected");
-    wsClients.delete(ws);
+    cleanup();
+  });
+
+  ws.on("error", (error) => {
+    console.error("[WS] Client error:", error.message);
+    cleanup();
   });
 });
 
@@ -490,16 +632,16 @@ wss.on("connection", (ws: WebSocket) => {
 // Start Server
 // =============================================================================
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, HOST, () => {
   console.log(`
-╔════════════════════════════════════════════════════════════╗
-║           Agent Manager MCP Server Running                 ║
-╠════════════════════════════════════════════════════════════╣
-║  HTTP Server:  http://localhost:${PORT}                       ║
-║  MCP Endpoint: http://localhost:${PORT}/mcp                   ║
-║  WebSocket:    ws://localhost:${PORT}/ws                      ║
-║  Health Check: http://localhost:${PORT}/health                ║
-╚════════════════════════════════════════════════════════════╝
++------------------------------------------------------------+
+|           Agent Manager MCP Server Running                 |
++------------------------------------------------------------+
+|  HTTP Server:  http://${HOST}:${PORT}                         |
+|  MCP Endpoint: http://${HOST}:${PORT}/mcp                     |
+|  WebSocket:    ws://${HOST}:${PORT}/ws                        |
+|  Health Check: http://${HOST}:${PORT}/health                  |
++------------------------------------------------------------+
 
 Add this to your Claude Code MCP config:
 {
