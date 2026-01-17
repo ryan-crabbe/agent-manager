@@ -4,10 +4,11 @@
   "private": true,
   "description": "Manage multiple Claude Code instances from a single dashboard",
   "scripts": {
-    "start": "concurrently -n mcp,ui -c blue,green \"npm run start:mcp\" \"npm run start:ui\"",
+    "start": "cd tui && bun run src/index.ts",
+    "start:electron": "concurrently -n mcp,ui -c blue,green \"npm run start:mcp\" \"npm run start:ui\"",
     "start:mcp": "cd mcp-server && npm run dev",
     "start:ui": "cd electron-app && npm run dev:renderer",
-    "install:all": "cd mcp-server && npm install && cd ../electron-app && npm install"
+    "install:all": "cd mcp-server && npm install && cd ../electron-app && npm install && cd ../tui && bun install"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

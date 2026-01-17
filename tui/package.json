@@ -1,0 +1,14 @@
+{
+  "name": "agent-manager-tui",
+  "version": "0.1.0",
+  "description": "TUI dashboard for monitoring Claude Code instances",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "dependencies": {
+    "@opentui/core": "latest"
+  }
+}
